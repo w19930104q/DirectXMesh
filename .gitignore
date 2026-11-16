@@ -25,7 +25,9 @@ Debug
 Profile
 Release
 x64
-/Tests
+/Tests/*
+!/Tests/CMakeLists.txt
+!/Tests/OptimizeLRUDegenerateTest.cpp
 /wiki
 /out
 /CMakeUserPresets.json

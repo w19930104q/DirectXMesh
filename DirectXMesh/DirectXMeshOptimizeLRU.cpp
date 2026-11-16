@@ -236,7 +236,6 @@ namespace
 
         // build the vertex remap table
         uint32_t uniqueVertexCount = 0;
-        uint32_t unused            = 0;
         {
             using indexSorter = IndexSortCompareIndexed<uint32_t, IndexType>;
 
@@ -258,7 +257,6 @@ namespace
                 const uint32_t idx = indexSorted[i];
                 if (indexList[idx] == IndexType(-1))
                 {
-                    unused++;
                     vertexRemap[idx] = UNUSED32;
                     continue;
                 }
@@ -281,13 +279,28 @@ namespace
         }
 
         // compute face count per vertex
-        for (uint32_t i = 0; i < indexCount; ++i)
+        //
+        // Faces that reference one or more unused vertices (i.e. the index
+        // value IndexType(-1)) can never be emitted by the optimizer, so they
+        // must not contribute to any vertex's active face list. Otherwise the
+        // stale entries would later be dereferenced through vertexRemap as
+        // vertexDataList[UNUSED32], which is far out of bounds.
+        uint32_t ignoredCorners = 0;
+        for (uint32_t i = 0; i < indexCount; i += 3)
         {
-            if (vertexRemap[i] == UNUSED32)
+            if (vertexRemap[i] == UNUSED32
+                || vertexRemap[size_t(i) + 1] == UNUSED32
+                || vertexRemap[size_t(i) + 2] == UNUSED32)
+            {
+                ignoredCorners += 3;
                 continue;
+            }
 
-            OptimizeVertexData<IndexType>& vertexData = vertexDataList[vertexRemap[i]];
-            vertexData.activeFaceListSize++;
+            for (uint32_t j = 0; j < 3; ++j)
+            {
+                OptimizeVertexData<IndexType>& vertexData = vertexDataList[vertexRemap[size_t(i) + size_t(j)]];
+                vertexData.activeFaceListSize++;
+            }
         }
 
         constexpr IndexType kEvictedCacheIndex = std::numeric_limits<IndexType>::max();
@@ -307,9 +320,9 @@ namespace
             }
 
 #ifndef NDEBUG
-            assert(curActiveFaceListPos == (indexCount - unused));
+            assert(curActiveFaceListPos == (indexCount - ignoredCorners));
 #else
-            std::ignore = unused;
+            std::ignore = ignoredCorners;
 #endif
         }
 
@@ -330,11 +343,17 @@ namespace
         // fill out face list per vertex
         for (uint32_t i = 0; i < indexCount; i += 3)
         {
+            if (vertexRemap[i] == UNUSED32
+                || vertexRemap[size_t(i) + 1] == UNUSED32
+                || vertexRemap[size_t(i) + 2] == UNUSED32)
+            {
+                // skipped face (see above)
+                continue;
+            }
+
             for (uint32_t j = 0; j < 3; ++j)
             {
                 const uint32_t v = vertexRemap[size_t(i) + size_t(j)];
-                if (v == UNUSED32)
-                    continue;
 
                 OptimizeVertexData<IndexType>& vertexData                                              = vertexDataList[v];
                 activeFaceList[size_t(vertexData.activeFaceListStart) + vertexData.activeFaceListSize] = i;
@@ -352,11 +371,11 @@ namespace
         {
             if (vertexRemap[i] == UNUSED32 || vertexRemap[i + 1] == UNUSED32 || vertexRemap[i + 2] == UNUSED32)
             {
-                ++bestFace;
                 continue;
             }
-            else
-                break;
+
+            bestFace = static_cast<uint32_t>(i);
+            break;
         }
 
         float bestScore = -1.f;
@@ -394,6 +413,13 @@ namespace
                     }
                 }
                 assert(bestScore >= 0.f);
+                if (bestScore < 0.f)
+                {
+                    // No unprocessed face with valid vertices remains. Bail out
+                    // rather than re-emitting a stale bestFace (which would
+                    // corrupt the output remap and walk off the active lists).
+                    break;
+                }
             }
 
             processedFaceList[bestFace / 3] = 1;
@@ -429,6 +455,13 @@ namespace
                 uint32_t* it    = std::find(begin, end, bestFace);
 
                 assert(it != end);
+                if (it == end)
+                {
+                    // Degenerate input left this face out of the vertex's active
+                    // list; skip it instead of swapping with end[-1] on what may
+                    // be an empty range (undefined behavior).
+                    continue;
+                }
 
                 std::swap(*it, *(end - 1));
 
@@ -506,6 +539,92 @@ namespace
             std::swap(cache0, cache1);
 
             entriesInCache0 = std::min<uint32_t>(entriesInCache1, lruCacheSize);
+        }
+
+        // For adversarial or degenerate inputs the greedy heuristic can produce
+        // an ordering whose vertex-cache hit rate is worse than simply walking
+        // the faces in their original order. Simulate a FIFO cache of
+        // lruCacheSize entries for both orderings and fall back to the original
+        // order if the optimized one is worse.
+        auto countCacheMisses = [&](const uint32_t* orderedFaces, uint32_t orderedCount) -> uint64_t
+        {
+            uint32_t fifo[kMaxVertexCacheSize] = {};
+            uint32_t fifoSize                  = 0;
+            uint32_t fifoHead                  = 0;
+            uint64_t misses                    = 0;
+
+            for (uint32_t k = 0; k < orderedCount; ++k)
+            {
+                const size_t face = size_t(orderedFaces[k]) * 3;
+                for (size_t j = 0; j < 3; ++j)
+                {
+                    const uint32_t v = vertexRemap[face + j];
+
+                    bool hit = false;
+                    for (uint32_t c = 0; c < fifoSize; ++c)
+                    {
+                        if (fifo[c] == v)
+                        {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if (hit)
+                        continue;
+
+                    ++misses;
+                    if (fifoSize < lruCacheSize)
+                    {
+                        fifo[fifoSize++] = v;
+                    }
+                    else
+                    {
+                        fifo[fifoHead] = v;
+                        fifoHead       = (fifoHead + 1) % lruCacheSize;
+                    }
+                }
+            }
+
+            return misses;
+        };
+
+        // faceSorted/faceReverseLookup are no longer needed by the optimizer;
+        // reuse them to hold the sequential and optimized face orders.
+        uint32_t validFaceCount = 0;
+        for (uint32_t f = 0; f < faceCount; ++f)
+        {
+            const size_t face = size_t(f) * 3;
+            if (vertexRemap[face] == UNUSED32
+                || vertexRemap[face + 1] == UNUSED32
+                || vertexRemap[face + 2] == UNUSED32)
+            {
+                continue;
+            }
+
+            faceSorted[validFaceCount++] = f;
+        }
+
+        assert(validFaceCount == curFace);
+
+        bool useOriginalOrder = (curFace != validFaceCount);
+        if (!useOriginalOrder)
+        {
+            for (uint32_t k = 0; k < curFace; ++k)
+            {
+                faceReverseLookup[k] = faceRemap[k] - offset;
+            }
+
+            useOriginalOrder = countCacheMisses(faceReverseLookup.get(), curFace) > countCacheMisses(faceSorted.get(), validFaceCount);
+        }
+
+        if (useOriginalOrder)
+        {
+            // The original order is at least as good; emit it instead.
+            curFace = 0;
+            for (uint32_t k = 0; k < validFaceCount; ++k)
+            {
+                faceRemap[curFace++] = faceSorted[k] + offset;
+            }
         }
 
         for (; curFace < faceCount; ++curFace)
