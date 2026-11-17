@@ -447,7 +447,8 @@ namespace
         if (nVerts >= index_t(-1))
             return;
 
-        size_t misses = 0;
+        size_t misses   = 0;
+        size_t nValid   = 0;
 
         std::unique_ptr<uint32_t[]> fifo(new (std::nothrow) uint32_t[cacheSize]);
         if (!fifo)
@@ -457,37 +458,57 @@ namespace
 
         memset(fifo.get(), 0xff, sizeof(uint32_t) * cacheSize);
 
-        for (size_t j = 0; j < (nFaces * 3); ++j)
+        // The post-transform cache is driven by whole triangles, so the index
+        // stream must be processed face by face rather than corner by corner.
+        // A triangle that references the "unused" sentinel (index_t(-1)) in
+        // any corner is never submitted to the GPU by the rest of the library
+        // (see OptimizeFacesLRU/ReorderIB), therefore it must not feed any
+        // index into the simulated cache. Handling such faces corner by corner
+        // would leave partial entries in the FIFO and make the reported rate
+        // depend on where the sentinel corners happen to sit.
+        for (size_t face = 0; face < nFaces; ++face)
         {
-            if (indices[j] == index_t(-1))
+            const index_t i0 = indices[face * 3];
+            const index_t i1 = indices[face * 3 + 1];
+            const index_t i2 = indices[face * 3 + 2];
+
+            if (i0 == index_t(-1) || i1 == index_t(-1) || i2 == index_t(-1))
                 continue;
 
-            if (indices[j] >= nVerts)
+            if (i0 >= nVerts || i1 >= nVerts || i2 >= nVerts)
                 return;
 
-            bool found = false;
+            ++nValid;
 
-            for (size_t ptr = 0; ptr < cacheSize; ++ptr)
+            const index_t tri[3] = { i0, i1, i2 };
+            for (size_t j = 0; j < 3; ++j)
             {
-                if (fifo[ptr] == indices[j])
+                bool found = false;
+
+                for (size_t ptr = 0; ptr < cacheSize; ++ptr)
                 {
-                    found = true;
-                    break;
+                    if (fifo[ptr] == tri[j])
+                    {
+                        found = true;
+                        break;
+                    }
                 }
-            }
 
-            if (!found)
-            {
-                ++misses;
-                fifo[tail] = indices[j];
-                ++tail;
-                if (tail == cacheSize)
-                    tail = 0;
+                if (!found)
+                {
+                    ++misses;
+                    fifo[tail] = tri[j];
+                    ++tail;
+                    if (tail == cacheSize)
+                        tail = 0;
+                }
             }
         }
 
         // ideal is 0.5, individual tris have 3.0
-        acmr = float(misses) / float(nFaces);
+        // Degenerate/unused faces are not rendered, so the ratio is taken
+        // over the triangles that actually went through the cache.
+        acmr = nValid ? float(misses) / float(nValid) : 0.f;
 
         // ideal is 1.0, worst case is 6.0
         atvr = float(misses) / float(nVerts);
